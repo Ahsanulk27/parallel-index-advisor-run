@@ -28,7 +28,7 @@ The original thesis run hung for 2+ hours and crashed an 8GB laptop because **ca
 4. Times a **parallel** run (`multiprocessing` pool; one connection per worker).
 5. Checks that sequential and parallel **planner costs match**.
 
-Default workload: **30 queries × 1,000 candidates = 30,000** unique checks.
+Default workload: **41 queries × 1,000 candidates = 41,000** unique checks.
 
 ## Setup
 
@@ -80,9 +80,11 @@ The script still runs on empty tables; speedup is valid, cost spreads will be sm
 ### 3. Python
 
 ```bash
-pip install psycopg2-binary
+pip install psycopg2-binary matplotlib
 python -c "import psycopg2; print('ok')"
 ```
+
+`matplotlib` is only needed for the optional Gantt plot (`plot_timeline.py`).
 
 ## Run
 
@@ -92,22 +94,35 @@ From this directory:
 python whatif_parallel.py
 ```
 
-That uses 30 queries, 1,000 candidates, and 4 workers. On this laptop the 30k-check run was about **3 minutes sequential vs ~39 seconds with 4 workers**.
+That uses 41 queries, 1,000 candidates, and 4 workers (no per-worker logs).
 
 Worker sweep (same workload, longer):
 
 ```bash
-python whatif_parallel.py --workers 2,4,6
+python whatif_parallel.py --workers 2,4,6,8
 ```
+
+Use this **without** `--verbose` for speedup numbers. Logging flushes a line after every candidate and can skew timings (especially `parallel x1`).
 
 Smaller / larger:
 
 ```bash
 python whatif_parallel.py --num-queries 10 --num-candidates 300 --workers 1,2,4,6,8
-python whatif_parallel.py --num-queries 30 --num-candidates 1000 --workers 4
+python whatif_parallel.py --num-queries 41 --num-candidates 1000 --workers 4
 ```
 
 `--num-candidates` cannot exceed the generated permutation pool (currently **3,468**). `--num-queries` cannot exceed the 41 statements in `tpch_balanced_42.json`.
+
+### Concurrent-worker logs (optional)
+
+`--verbose` writes one `worker_<pid>.log` per parallel process (START, per-candidate, END, with wall-clock `t=`). Sequential is not logged. Plot overlapping PIDs:
+
+```bash
+python whatif_parallel.py --workers 4 --verbose
+python plot_timeline.py --log-dir worker_logs/<timestamp>/workers_4
+```
+
+That saves `worker_timeline.png`. Overlapping bars mean workers ran at the same time. `worker_logs/` is gitignored.
 
 ## Reading the output
 
@@ -126,8 +141,9 @@ Speedup often **tapers after 4–6 workers** on an 8-core laptop: each worker is
 | File | Role |
 |---|---|
 | `whatif_parallel.py` | Sequential vs parallel experiment |
+| `plot_timeline.py` | Gantt chart from `--verbose` worker logs |
 | `tpch_balanced_42.json` | TPC-H-style query list |
 | `Dockerfile` | PostgreSQL 15 image with HypoPG 1.4.2 compiled in |
 | `docker/init/` | Creates HypoPG + TPC-H schema on first container start |
 
-Do not commit `__pycache__/` or `*.pyc`.
+Do not commit `__pycache__/`, `worker_logs/`, or generated `worker_timeline.png`.

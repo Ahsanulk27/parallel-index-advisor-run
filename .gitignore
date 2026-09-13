@@ -7,3 +7,5 @@ venv/
 .env
 .DS_Store
 Thumbs.db
+worker_logs/
+worker_timeline.png

@@ -12,11 +12,12 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import os
 import time
 from dataclasses import dataclass
 from multiprocessing import Pool
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 import psycopg2
 
@@ -29,7 +30,7 @@ DB_CONFIG = {
     "dbname": "indextest",
 }
 
-DEFAULT_NUM_QUERIES = 30
+DEFAULT_NUM_QUERIES = 41
 DEFAULT_NUM_CANDIDATES = 1000
 DEFAULT_WORKERS = "4"
 MAX_INDEX_WIDTH = 3
@@ -122,6 +123,16 @@ class CandidateIndex:
 
     index_id: int
     spec: str
+
+
+@dataclass(frozen=True)
+class WorkerJob:
+    """Work sent to one process: queries, a candidate slice, and log settings."""
+
+    queries: list[str]
+    chunk: list[CandidateIndex]
+    verbose: bool
+    log_dir: str | None
 
 
 @dataclass(frozen=True)
@@ -264,22 +275,59 @@ def split_candidates(
     return [chunk for chunk in chunks if chunk]
 
 
-def process_candidates(
-    job: tuple[list[str], list[CandidateIndex]],
-) -> list[EstimateResult]:
+def open_worker_log(verbose: bool, log_dir: str | None, pid: int) -> TextIO | None:
+    """
+    Open this process's log file when verbose logging is enabled.
+
+    :param verbose: Whether to write a per-worker log
+    :param log_dir: Directory for ``worker_<pid>.log`` files
+    :param pid: Current process id
+    :returns: An open text handle, or None
+    """
+    if not verbose or not log_dir:
+        return None
+    path = Path(log_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    return (path / f"worker_{pid}.log").open("w", encoding="utf-8")
+
+
+def write_log(handle: TextIO | None, message: str) -> None:
+    """
+    Write one log line and flush so a crash still leaves a complete trail.
+
+    :param handle: Worker log file, or None when logging is off
+    :param message: Line to append (no trailing newline required)
+    """
+    if handle is None:
+        return
+    handle.write(message + "\n")
+    handle.flush()
+
+
+def process_candidates(job: WorkerJob) -> list[EstimateResult]:
     """
     Cost every query against this worker's candidate indexes on one connection.
 
-    :param job: Query list plus candidate indexes assigned to this worker
+    :param job: Query list, candidate slice, and optional verbose log settings
     :returns: Cost results for all (query, candidate) pairs in the chunk
     """
-    queries, chunk = job
+    queries = job.queries
+    chunk = job.chunk
+    worker_pid = os.getpid()
+    start_perf = time.perf_counter()
+    log_handle = open_worker_log(job.verbose, job.log_dir, worker_pid)
     conn = connect()
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT hypopg_reset();")
+        write_log(
+            log_handle,
+            f"[worker pid={worker_pid}] START  chunk_size={len(chunk)} "
+            f"queries={len(queries)} t={time.time():.4f}",
+        )
         results: list[EstimateResult] = []
         for candidate in chunk:
+            candidate_t = time.time()
             for query_id, query in enumerate(queries):
                 results.append(
                     EstimateResult(
@@ -288,9 +336,22 @@ def process_candidates(
                         cost=estimate_pair(conn, query, candidate.spec),
                     )
                 )
+            write_log(
+                log_handle,
+                f"[worker pid={worker_pid}] candidate={candidate.index_id} "
+                f"queries_run={len(queries)} t={candidate_t:.4f}",
+            )
+        elapsed = time.perf_counter() - start_perf
+        write_log(
+            log_handle,
+            f"[worker pid={worker_pid}] END    checks_done={len(results)} "
+            f"elapsed={elapsed:.4f}s t={time.time():.4f}",
+        )
         return results
     finally:
         conn.close()
+        if log_handle is not None:
+            log_handle.close()
 
 
 def run_sequential(
@@ -300,17 +361,24 @@ def run_sequential(
     """
     Estimate every pair on a single connection in this process.
 
+    Sequential runs never write verbose worker logs so a ``--workers 4 --verbose``
+    log directory contains only the parallel PIDs.
+
     :param queries: SQL statements to cost
     :param candidates: Full candidate list
     :returns: Cost results in input order
     """
-    return process_candidates((queries, candidates))
+    return process_candidates(
+        WorkerJob(queries=queries, chunk=candidates, verbose=False, log_dir=None)
+    )
 
 
 def run_parallel(
     queries: list[str],
     candidates: list[CandidateIndex],
     workers: int,
+    verbose: bool = False,
+    log_dir: Path | None = None,
 ) -> list[EstimateResult]:
     """
     Split candidates across worker processes, each with its own DB connection.
@@ -318,10 +386,21 @@ def run_parallel(
     :param queries: SQL statements to cost
     :param candidates: Full candidate list
     :param workers: Number of processes / connections
+    :param verbose: Write per-worker START/END and per-candidate timestamps
+    :param log_dir: Directory for ``worker_<pid>.log`` files
     :returns: Cost results sorted by (query_id, index_id)
     """
     chunks = split_candidates(candidates, workers)
-    jobs = [(queries, chunk) for chunk in chunks]
+    log_dir_str = str(log_dir) if verbose and log_dir is not None else None
+    jobs = [
+        WorkerJob(
+            queries=queries,
+            chunk=chunk,
+            verbose=verbose,
+            log_dir=log_dir_str,
+        )
+        for chunk in chunks
+    ]
     with Pool(processes=len(chunks)) as pool:
         nested = pool.map(process_candidates, jobs)
     results = [row for chunk_rows in nested for row in chunk_rows]
@@ -400,6 +479,11 @@ def parse_args() -> argparse.Namespace:
         default=parse_worker_list(DEFAULT_WORKERS),
         help=f"Parallel worker counts to sweep (default: {DEFAULT_WORKERS})",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Write per-worker START/END and per-candidate timestamps to log files",
+    )
     return parser.parse_args()
 
 
@@ -440,7 +524,15 @@ def main() -> None:
     print(f"  candidates used      : {len(candidates)}")
     print(f"  unique checks        : {total_checks}")
     print(f"  worker sweep         : {args.workers}")
+    print(f"  verbose logging      : {args.verbose}")
     print()
+
+    run_log_root: Path | None = None
+    if args.verbose:
+        run_log_root = Path("worker_logs") / time.strftime("%Y%m%d_%H%M%S")
+        run_log_root.mkdir(parents=True, exist_ok=True)
+        print(f"  verbose log dir      : {run_log_root}")
+        print()
 
     print("Warming up planner / connection...")
     warmup()
@@ -463,8 +555,18 @@ def main() -> None:
 
     for workers in args.workers:
         print(f"Running parallel ({workers} workers, 1 connection each)...")
+        worker_log_dir = None
+        if args.verbose and run_log_root is not None:
+            worker_log_dir = run_log_root / f"workers_{workers}"
+            print(f"  verbose logs         : {worker_log_dir}")
         t1 = time.perf_counter()
-        parallel = run_parallel(queries, candidates, workers)
+        parallel = run_parallel(
+            queries,
+            candidates,
+            workers,
+            verbose=args.verbose,
+            log_dir=worker_log_dir,
+        )
         parallel_s = time.perf_counter() - t1
         speedup = sequential_s / parallel_s if parallel_s > 0 else 0.0
         matched = costs_match(sequential, parallel)
@@ -488,6 +590,13 @@ def main() -> None:
         print(
             f"  Q{q_id + 1:<2}  min={min(costs):.2f}  max={max(costs):.2f}  "
             f"spread={max(costs) - min(costs):.2f}"
+        )
+
+    if args.verbose and run_log_root is not None:
+        print()
+        print("Verbose worker logs written. Plot a Gantt chart with:")
+        print(
+            f"  python plot_timeline.py --log-dir {run_log_root / f'workers_{args.workers[-1]}'}"
         )
 
 
